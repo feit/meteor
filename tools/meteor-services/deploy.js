@@ -42,6 +42,8 @@ const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 // - bodyStream: if provided, a stream to use as the request body
 // - any other parameters accepted by the node 'request' module, for example
 //   'qs' to set query string parameters
+// - printDeployURL: provided if we should show the deploy URL; set this
+//   for the first RPC of any user command
 //
 // Waits until server responds, then returns an object with the
 // following keys:
@@ -66,10 +68,16 @@ var deployRpc = function (options) {
   }
   options.qs = _.extend({}, options.qs, {capabilities: CAPABILITIES});
 
+  const deployURLBase = getDeployURL(options.site);
+
+  if (options.printDeployURL) {
+    Console.info("Talking to Galaxy servers at " + deployURLBase);
+  }
+
   // XXX: Reintroduce progress for upload
   try {
     var result = httpHelpers.request(_.extend(options, {
-      url: config.getDeployUrl() + '/' + options.operation +
+      url: deployURLBase + '/' + options.operation +
         (options.site ? ('/' + options.site) : ''),
       method: options.method || 'GET',
       bodyStream: options.bodyStream,
@@ -148,7 +156,8 @@ var authedRpc = function (options) {
     operation: 'info',
     site: rpcOptions.site,
     expectPayload: [],
-    qs: options.qs
+    qs: options.qs,
+    printDeployURL: options.printDeployURL
   });
 
   if (infoResult.statusCode === 401 && rpcOptions.promptIfAuthFails) {
@@ -374,7 +383,8 @@ var bundleAndDeploy = function (options) {
     site: site,
     preflight: true,
     promptIfAuthFails: promptIfAuthFails,
-    qs: options.rawOptions
+    qs: options.rawOptions,
+    printDeployURL: true
   });
 
   if (preflight.errorMessage) {
@@ -493,7 +503,8 @@ var deleteApp = function (site) {
     method: 'DELETE',
     operation: 'deploy',
     site: site,
-    promptIfAuthFails: true
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (result.errorMessage) {
@@ -518,7 +529,8 @@ var checkAuthThenSendRpc = function (site, operation, what) {
     operation: operation,
     site: site,
     preflight: true,
-    promptIfAuthFails: true
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (preflight.errorMessage) {
@@ -624,7 +636,8 @@ var listAuthorized = function (site) {
   var result = deployRpc({
     operation: 'info',
     site: site,
-    expectPayload: []
+    expectPayload: [],
+    printDeployURL: true
   });
   if (result.errorMessage) {
     Console.error("Couldn't get authorized users list: " + result.errorMessage);
@@ -675,7 +688,8 @@ var changeAuthorized = function (site, action, username) {
     operation: 'authorized',
     site: site,
     qs: {[action]: username},
-    promptIfAuthFails: true
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (result.errorMessage) {
@@ -704,7 +718,8 @@ var claim = function (site) {
   // straight away (at a cost of an extra REST call)
   var infoResult = deployRpc({
     operation: 'info',
-    site: site
+    site: site,
+    printDeployURL: true
   });
   if (infoResult.statusCode === 404) {
     Console.error(
@@ -799,6 +814,88 @@ var listSites = function () {
   return 0;
 };
 
+// Given a hostname, add "http://" or "https://" as
+// appropriate. (localhost gets http; anything else is always https.)
+function addScheme(hostOrURL) {
+  if (hostOrURL.match(/^http/)) {
+    return hostOrURL;
+  } else if (hostOrURL.match(/^localhost(:\d+)?$/)) {
+    return "http://" + hostOrURL;
+  } else {
+    return "https://" + hostOrURL;
+  }
+};
+
+// Maps from "site" to deploy URL, so we don't have to re-ping on each RPC.
+const galaxyDiscoveryCache = new Map;
+
+// getDeployURL returns the base deploy URL for the given app.  "app" may be
+// falsey for certain RPCs (eg meteor list-sites).
+function getDeployURL(site) {
+  // Always trust explicitly configuration via env.
+  if (process.env.DEPLOY_HOSTNAME) {
+    return addScheme(process.env.DEPLOY_HOSTNAME);
+  }
+
+  const defaultURL = "https://galaxy.meteor.com";
+
+  // No site? Just use the default.
+  if (!site) {
+    return defaultURL;
+  }
+
+  // If we have a site, we can try to do Galaxy discovery.
+
+  // Do we already have an answer?
+  if (galaxyDiscoveryCache.has(site)) {
+    return galaxyDiscoveryCache.get(site);
+  }
+
+  // Try https first.  Production users should enable https so we will never
+  // fall back to http for them.
+  const urlFromHTTPS = discoverGalaxy(site, "https");
+  if (urlFromHTTPS !== null) {
+    galaxyDiscoveryCache.set(site, urlFromHTTPS);
+    return urlFromHTTPS;
+  }
+
+  // Maybe https isn't set up yet. Try http.
+  const urlFromHTTP = discoverGalaxy(site, "http");
+  if (urlFromHTTP !== null) {
+    galaxyDiscoveryCache.set(site, urlFromHTTP);
+    return urlFromHTTP;
+  }
+
+  // Nope, let's just use the default (and remember it).
+  galaxyDiscoveryCache.set(site, defaultURL);
+  return defaultURL;
+}
+
+function discoverGalaxy(site, scheme) {
+  const discoveryURL = scheme + "://" + site +
+          "/.well-known/meteor/galaxy/discovery";
+  let result;
+  try {
+    result = httpHelpers.request({
+      url: discoveryURL,
+      json: true,
+      strictSSL: true,
+      // We don't want to be confused by, eg, a non-Galaxy-hosted site which
+      // redirects to a Galaxy-hosted site.
+      followRedirect: false
+    });
+  } catch (e) {
+    // If we fail for any reason, just assume we didn't discover anything.
+    return null;
+  }
+  if (result.response.statusCode === 200 &&
+      result.body &&
+      result.body.galaxyDiscoveryVersion === "galaxy-1" &&
+      _.has(result.body, "deployURL")) {
+    return result.body.deployURL;
+  }
+  return null;
+}
 
 exports.bundleAndDeploy = bundleAndDeploy;
 exports.deleteApp = deleteApp;
